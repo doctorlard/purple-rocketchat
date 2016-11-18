@@ -173,7 +173,7 @@ purple_chat_conversation_find_user(PurpleChatConversation *chat, const char *nam
 }
 #define purple_chat_user_get_flags(cb)     purple_conv_chat_user_get_flags(g_dataset_get_data((cb), "chat"), (cb)->name)
 #define purple_chat_user_set_flags(cb, f)  purple_conv_chat_user_set_flags(g_dataset_get_data((cb), "chat"), (cb)->name, (f))
-#define purple_chat_user_set_alias(cb, a)  ((cb)->alias = (a))
+#define purple_chat_user_set_alias(cb, a)  (g_free((cb)->alias), (cb)->alias = g_strdup(a))
 #define PurpleIMTypingState	PurpleTypingState
 #define PURPLE_IM_NOT_TYPING	PURPLE_NOT_TYPING
 #define PURPLE_IM_TYPING	PURPLE_TYPING
@@ -231,6 +231,8 @@ purple_message_destroy(PurpleMessage *message)
 #define purple_conversation_set_data(conv, key, value)  g_object_set_data(G_OBJECT(conv), key, value)
 #define purple_conversation_get_data(conv, key)         g_object_get_data(G_OBJECT(conv), key)
 #define purple_message_destroy          g_object_unref
+#define purple_chat_user_set_alias(cb, alias)  g_object_set((cb), "alias", (alias), NULL)
+#define purple_chat_get_alias(chat)  g_object_get_data(G_OBJECT(chat), "alias")
 #endif
 
 
@@ -267,6 +269,7 @@ typedef struct {
 	GHashTable *result_callbacks; // Result ID -> Callback function
 	GHashTable *usernames_to_ids; // username -> user id
 	GHashTable *ids_to_usernames; // user id -> username
+	GQueue *received_message_queue; // A store of the last 10 received message id's for de-dup
 
 	GSList *http_conns; /**< PurpleHttpConnection to be cancelled on logout */
 	gint frames_since_reconnect;
@@ -326,7 +329,7 @@ rc_markdown_to_html(const gchar *markdown)
 {
 	static char *markdown_str = NULL;
 	int markdown_len;
-	int flags = MKD_NOPANTS | MKD_NOHEADER | MKD_NODIVQUOTE | MKD_NODLIST;
+	int flags = MKD_NOPANTS | MKD_NODIVQUOTE | MKD_NODLIST;
 	
 	if (markdown_str != NULL) {
 		free(markdown_str);
@@ -787,7 +790,6 @@ rc_fetch_url(RocketChatAccount *ya, const gchar *url, const gchar *postdata, Roc
 
 
 static void rc_join_room(RocketChatAccount *ya, const gchar *room_id);
-void rc_block_user(PurpleConnection *pc, const char *who);
 static void rc_socket_write_json(RocketChatAccount *ya, JsonObject *data);
 static GHashTable *rc_chat_info_defaults(PurpleConnection *pc, const char *chatname);
 static void rc_mark_room_messages_read(RocketChatAccount *ya, const gchar *room_id);
@@ -975,16 +977,33 @@ rc_role_to_purple_flag(RocketChatAccount *ya, const gchar *role)
 static gint64 rc_get_room_last_timestamp(RocketChatAccount *ya, const gchar *room_id);
 static void rc_set_room_last_timestamp(RocketChatAccount *ya, const gchar *room_id, gint64 last_timestamp);
 
-static gint64
-rc_process_room_message(RocketChatAccount *ya, JsonObject *message, JsonObject *roomarg)
+static gboolean
+rc_have_seen_message_id(RocketChatAccount *ya, const gchar *message_id)
 {
-	JsonObject *ts = json_object_get_object_member(message, "ts");
-	JsonObject *u = json_object_get_object_member(message, "u");
+	guint message_hash = g_str_hash(message_id);
+	gpointer message_hash_ptr = GINT_TO_POINTER(message_hash);
 	
-	const gchar *_id = json_object_get_string_member(message, "_id");
-	const gchar *msg_text = json_object_get_string_member(message, "msg");
-	const gchar *rid = json_object_get_string_member(message, "rid");
-	const gchar *t = json_object_get_string_member(message, "t");
+	if (g_queue_find(ya->received_message_queue, message_hash_ptr)) {
+		return TRUE;
+	}
+	
+	g_queue_push_head(ya->received_message_queue, message_hash_ptr);
+	g_queue_pop_nth(ya->received_message_queue, 10);
+	
+	return FALSE;
+}
+
+
+static gint64
+rc_process_room_message(RocketChatAccount *ya, JsonObject *message_obj, JsonObject *roomarg)
+{
+	JsonObject *ts = json_object_get_object_member(message_obj, "ts");
+	JsonObject *u = json_object_get_object_member(message_obj, "u");
+	
+	const gchar *_id = json_object_get_string_member(message_obj, "_id");
+	const gchar *msg_text = json_object_get_string_member(message_obj, "msg");
+	const gchar *rid = json_object_get_string_member(message_obj, "rid");
+	const gchar *t = json_object_get_string_member(message_obj, "t");
 	const gchar *username = json_object_get_string_member(u, "username");
 	const gchar *roomType = json_object_get_string_member(roomarg, "roomType");
 	const gchar *room_name = g_hash_table_lookup(ya->group_chats, rid);
@@ -1039,11 +1058,11 @@ rc_process_room_message(RocketChatAccount *ya, JsonObject *message, JsonObject *
 		}
 		
 		if (chatconv != NULL) {
-			const gchar *role = json_object_get_string_member(message, "role");
+			const gchar *role = json_object_get_string_member(message_obj, "role");
 			PurpleChatUser *cb = purple_chat_conversation_find_user(chatconv, msg_text);
 			PurpleChatUserFlags flags;
 			if (cb == NULL) {
-				purple_chat_conversation_add_user(chatconv, msg_text, NULL, purple_chat_user_get_flags(cb), FALSE);
+				purple_chat_conversation_add_user(chatconv, msg_text, NULL, rc_role_to_purple_flag(ya, role), FALSE);
 			} else {
 				flags = purple_chat_user_get_flags(cb);
 				purple_chat_user_set_flags(cb, flags | rc_role_to_purple_flag(ya, role));
@@ -1056,7 +1075,7 @@ rc_process_room_message(RocketChatAccount *ya, JsonObject *message, JsonObject *
 		}
 		
 		if (chatconv != NULL) {
-			const gchar *role = json_object_get_string_member(message, "role");
+			const gchar *role = json_object_get_string_member(message_obj, "role");
 			PurpleChatUser *cb = purple_chat_conversation_find_user(chatconv, msg_text);
 			PurpleChatUserFlags flags;
 			if (cb == NULL) {
@@ -1099,17 +1118,60 @@ rc_process_room_message(RocketChatAccount *ya, JsonObject *message, JsonObject *
 			purple_chat_conversation_set_topic(chatconv, NULL, html_topic);
 			g_free(html_topic);
 		}
-	} else {
-		gchar *message = rc_markdown_to_html(msg_text);
+	} else if (!rc_have_seen_message_id(ya, _id) || json_object_has_member(message_obj, "editedBy")) {
+		// Dont display duplicate messages (eg where the server inspects urls to give icons/header/content)
+		//  but do display edited messages
 		
-		// check we didn't send this
+		// check we didn't send this ourselves
 		if (msg_flags == PURPLE_MESSAGE_RECV || !g_hash_table_remove(ya->sent_message_ids, _id)) {
+			gchar *message = rc_markdown_to_html(msg_text);
+			
+			if (json_object_has_member(message_obj, "attachments")) {
+				JsonArray *attachments = json_object_get_array_member(message_obj, "attachments");
+				guint i, len = json_array_get_length(attachments);
+				
+				for (i = 0; i < len; i++) {
+					JsonObject *attachment = json_array_get_object_element(attachments, i);
+					const gchar *title = json_object_get_string_member(attachment, "title");
+					const gchar *title_link = json_object_get_string_member(attachment, "title_link");
+					
+					if (title != NULL && title_link != NULL) {
+						gchar *temp_message = g_strdup_printf("%s <a href=\"https://%s%s\">%s</a>", (message ? message : ""), ya->server, title_link, title);
+						g_free(message);
+						message = temp_message;
+					}
+					// TODO inline images?
+				}
+			}
+			
 			if ((roomType != NULL && *roomType != 'd') || g_hash_table_contains(ya->group_chats, rid)) {
+				PurpleChatConversation *chatconv = purple_conversations_find_chat_with_account(room_name, ya->account);
+				PurpleChatUser *cb;
+				
+				if (chatconv == NULL) {
+					chatconv = purple_conversations_find_chat_with_account(rid, ya->account);
+				}
+				
+				cb = purple_chat_conversation_find_user(chatconv, username);
+				if (cb == NULL) {
+					purple_chat_conversation_add_user(chatconv, username, NULL, PURPLE_CHAT_USER_NONE, FALSE);
+					cb = purple_chat_conversation_find_user(chatconv, username);
+				}
+				
+				if (json_object_has_member(message_obj, "bot") && json_object_has_member(message_obj, "alias")) {
+					const gchar *alias = json_object_get_string_member(message_obj, "alias");
+					purple_chat_user_set_alias(cb, alias);
+				}
+				
 				// Group chat message
 				purple_serv_got_chat_in(ya->pc, g_str_hash(rid), username, msg_flags, message, timestamp);
 				
 				if (purple_conversation_has_focus(PURPLE_CONVERSATION(purple_conversations_find_chat_with_account(room_name ? room_name : rid, ya->account)))) {
 					rc_mark_room_messages_read(ya, rid);
+				}
+				
+				if (json_object_has_member(message_obj, "bot") && json_object_has_member(message_obj, "alias")) {
+					purple_chat_user_set_alias(cb, NULL);
 				}
 				
 			} else {
@@ -1139,9 +1201,10 @@ rc_process_room_message(RocketChatAccount *ya, JsonObject *message, JsonObject *
 					purple_message_destroy(pmsg);
 				}
 			}
+			
+			g_free(message);
 		}
 		
-		g_free(message);
 	}
 	
 	return sdate;
@@ -1716,6 +1779,7 @@ rc_login(PurpleAccount *account)
 	ya->result_callbacks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	ya->usernames_to_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	ya->ids_to_usernames = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	ya->received_message_queue = g_queue_new();
 	
 	userparts = g_strsplit(username, (char[2]) {RC_SERVER_SPLIT_CHAR, '\0'}, 2);
 	purple_connection_set_display_name(pc, userparts[0]);
@@ -1770,6 +1834,7 @@ rc_close(PurpleConnection *pc)
 	g_hash_table_unref(ya->usernames_to_ids);
 	g_hash_table_remove_all(ya->ids_to_usernames);
 	g_hash_table_unref(ya->ids_to_usernames);
+	g_queue_free(ya->received_message_queue);
 
 	while (ya->http_conns) {
 #	if !PURPLE_VERSION_CHECK(3, 0, 0)
@@ -2172,47 +2237,23 @@ rc_start_socket(RocketChatAccount *ya)
 
 
 
-void
-rc_block_user(PurpleConnection *pc, const char *who)
-{
-	// RocketChatAccount *ya = purple_connection_get_protocol_data(pc);
-	// JsonObject *data = json_object_new();
-	
-	// json_object_set_string_member(data, "msg", "SetUserBlocked");
-	// json_object_set_string_member(data, "userId", who);
-	// json_object_set_int_member(data, "opId", ya->opid++);
-	// json_object_set_boolean_member(data, "blocked", TRUE);
-	
-	// rc_socket_write_json(ya, data);
-}
 
-void
-rc_unblock_user(PurpleConnection *pc, const char *who)
-{
-	// RocketChatAccount *ya = purple_connection_get_protocol_data(pc);
-	// JsonObject *data = json_object_new();
-	
-	// json_object_set_string_member(data, "msg", "SetUserBlocked");
-	// json_object_set_string_member(data, "userId", who);
-	// json_object_set_int_member(data, "opId", ya->opid++);
-	// json_object_set_boolean_member(data, "blocked", FALSE);
-	
-	// rc_socket_write_json(ya, data);
-}
 
 static void
 rc_chat_leave_by_room_id(PurpleConnection *pc, const gchar *room_id)
 {
-	// RocketChatAccount *ya;
-	// JsonObject *data = json_object_new();
+	RocketChatAccount *ya = purple_connection_get_protocol_data(pc);
+	JsonObject *data = json_object_new();
+	JsonArray *params = json_array_new();
 	
-	// ya = purple_connection_get_protocol_data(pc);
+	json_array_add_string_element(params, room_id);
 	
-	// json_object_set_string_member(data, "msg", "LeaveGroup");
-	// json_object_set_string_member(data, "groupId", groupId);
-	// json_object_set_int_member(data, "opId", ya->opid++);
+	json_object_set_string_member(data, "msg", "method");
+	json_object_set_string_member(data, "method", "leaveRoom");
+	json_object_set_array_member(data, "params", params);
+	json_object_set_string_member(data, "id", rc_get_next_id_str(ya));
 	
-	// rc_socket_write_json(ya, data);
+	rc_socket_write_json(ya, data);
 }
 
 static void
@@ -2419,7 +2460,7 @@ rc_got_history_of_room(RocketChatAccount *ya, JsonNode *node, gpointer user_data
 		JsonObject *ts = json_object_get_object_member(message, "ts");
 		gint64 sdate = json_object_get_int_member(ts, "$date");
 		
-		if (last_message > sdate) {
+		if (last_message >= sdate) {
 			continue;
 		}
 		
@@ -3156,7 +3197,7 @@ rc_add_account_options(GList *account_options)
 }
 
 static PurpleCmdRet
-rc_cmd_leave(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, void *data)
+rc_cmd_leave(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, gpointer data)
 {
 	PurpleConnection *pc = NULL;
 	int id = -1;
@@ -3172,15 +3213,144 @@ rc_cmd_leave(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **e
 	return PURPLE_CMD_RET_OK;
 }
 
+static PurpleCmdRet
+rc_slash_command(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, gpointer userdata)
+{
+	PurpleConnection *pc = NULL;
+	RocketChatAccount *ya = NULL;
+	const gchar *room_id = NULL;
+	JsonObject *data;
+	JsonArray *params;
+	JsonObject *slash_param;
+	JsonObject *msg;
+	gchar *params_str;
+	gchar *original_msg;
+	gchar *_id;
+	
+	pc = purple_conversation_get_connection(conv);
+	if (pc == NULL) {
+		return PURPLE_CMD_RET_FAILED;
+	}
+	ya = purple_connection_get_protocol_data(pc);
+	if (ya == NULL) {
+		return PURPLE_CMD_RET_FAILED;
+	}
+	
+	room_id = purple_conversation_get_data(conv, "id");
+	if (room_id == NULL) {
+		if (PURPLE_IS_IM_CONVERSATION(conv)) {
+			room_id = g_hash_table_lookup(ya->one_to_ones_rev, purple_conversation_get_name(conv));
+		} else {
+			room_id = purple_conversation_get_name(conv);
+			if (g_hash_table_lookup(ya->group_chats_rev, room_id)) {
+				// Convert friendly name into id
+				room_id = g_hash_table_lookup(ya->group_chats_rev, room_id);
+			}
+		}
+	}
+	if (room_id == NULL) {
+		return PURPLE_CMD_RET_FAILED;
+	}
+	
+	//["{\"msg\":\"method\",\"method\":\"slashCommand\",\"params\":[{\"cmd\":\"lennyface\",\"params\":\"all the stuff\",\"msg\":{\"_id\":\"ANLQgCTo33wGcjXZT\",\"rid\":\"YdpayxcMhWFGKRZb3hZKg86uJavE6jYLya\",\"msg\":\"/lennyface all the stuff\"}}],\"id\":\"65\"}"]
+	
+	data = json_object_new();
+	params = json_array_new();
+	slash_param = json_object_new();
+	msg = json_object_new();
+	
+	
+	json_object_set_string_member(slash_param, "cmd", cmd);
+	
+	params_str = g_strjoinv(" ", args);
+	original_msg = g_strconcat(cmd, " ", params_str, NULL);
+	json_object_set_string_member(slash_param, "params", params_str);
+	g_free(params_str);
+	
+	_id = g_strdup_printf("%012XFFFF", g_random_int());
+	json_object_set_string_member(msg, "_id", _id);
+	g_free(_id);
+	json_object_set_string_member(msg, "rid", room_id);
+	json_object_set_string_member(msg, "msg", original_msg);
+	g_free(original_msg);
+	
+	json_object_set_object_member(slash_param, "msg", msg);
+	json_array_add_object_element(params, slash_param);
+	
+	json_object_set_string_member(data, "msg", "method");
+	json_object_set_string_member(data, "method", "slashCommand");
+	json_object_set_array_member(data, "params", params);
+	json_object_set_string_member(data, "id", rc_get_next_id_str(ya));
+	
+	json_object_ref(data);
+	rc_socket_write_json(ya, data);
+	
+	// Send the same request again without the second parameter for older servers
+	json_array_remove_element(params, 1);
+	rc_socket_write_json(ya, data);
+	
+	return PURPLE_CMD_RET_OK;
+}
+
 static gboolean
 plugin_load(PurplePlugin *plugin, GError **error)
 {
 	//["{\"msg\":\"method\",\"method\":\"slashCommand\",\"params\":[{\"cmd\":\"join\",\"params\":\"#general \",\"msg\":{\"_id\":\"FLpX4en75muW3raxH\",\"rid\":\"hZKg86uJavE6jYLyaoAKZSpTPTQHbp6nBD\",\"msg\":\"/join #general \"}}],\"id\":\"19\"}"]
+						
+	purple_cmd_register("create", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_IM |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("create <name>:  Create a new channel"), NULL);
+						
+	purple_cmd_register("invite", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("invite <username>:  Invite user to join channel"), NULL);
+						
+	purple_cmd_register("join", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_IM |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("join <name>:  Join a channel"), NULL);
+						
+	purple_cmd_register("kick", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("kick <username>:  Remove someone from channel"), NULL);
 	
 	purple_cmd_register("leave", "", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
 						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 						ROCKETCHAT_PLUGIN_ID, rc_cmd_leave,
-						_("leave:  Leave the group chat"), NULL);
+						_("leave:  Leave the channel"), NULL);
+	
+	purple_cmd_register("part", "", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_cmd_leave,
+						_("part:  Leave the channel"), NULL);
+	
+	purple_cmd_register("me", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_IM |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("me <action>:  Display action text"), NULL);
+	
+	purple_cmd_register("msg", "ss", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_IM |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("msg <username> <message>:  Direct message someone"), NULL);
+	
+	purple_cmd_register("mute", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("mute <username>:  Mute someone in channel"), NULL);
+	
+	purple_cmd_register("unmute", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("unmute <username>:  Un-mute someone in channel"), NULL);
+	
+	purple_cmd_register("topic", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						ROCKETCHAT_PLUGIN_ID, rc_slash_command,
+						_("topic <description>:  Set the channel topic description"), NULL);
 	
 	return TRUE;
 }
@@ -3255,8 +3425,6 @@ plugin_init(PurplePlugin *plugin)
 	prpl_info->close = rc_close;
 	prpl_info->send_im = rc_send_im;
 	prpl_info->send_typing = rc_send_typing;
-	// prpl_info->add_deny = rc_block_user;
-	// prpl_info->rem_deny = rc_unblock_user;
 	prpl_info->join_chat = rc_join_chat;
 	prpl_info->get_chat_name = rc_get_chat_name;
 	prpl_info->chat_invite = rc_chat_invite;
@@ -3347,13 +3515,6 @@ rc_protocol_class_init(PurpleProtocolClass *prpl_info)
 	prpl_info->list_icon = rc_list_icon;
 }
 
-static void
-rc_protocol_privacy_iface_init(PurpleProtocolPrivacyIface *prpl_info)
-{
-	prpl_info->add_deny = rc_block_user;
-	prpl_info->rem_deny = rc_unblock_user;
-}
-
 static void 
 rc_protocol_im_iface_init(PurpleProtocolIMIface *prpl_info)
 {
@@ -3404,9 +3565,6 @@ PURPLE_DEFINE_TYPE_EXTENDED(
 
 	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_CHAT_IFACE,
 	                                  rc_protocol_chat_iface_init)
-
-	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_PRIVACY_IFACE,
-	                                  rc_protocol_privacy_iface_init)
 
 	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_SERVER_IFACE,
 	                                  rc_protocol_server_iface_init)
